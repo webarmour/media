@@ -386,21 +386,26 @@ public final class BoxParser {
     if (stsdData.format == null) {
       return null;
     }
-    Format format;
+    Format format = stsdData.format;
+    if (trackType == C.TRACK_TYPE_AUDIO
+        && MimeTypes.AUDIO_AAC.equals(format.sampleMimeType)
+        && format.initializationData.isEmpty()) {
+      format = synthesizeAacFormatIfPossible(format, mdhdData.timescale, stbl);
+      if (format == null) {
+        return null;
+      }
+    }
     if (tkhdData.alternateGroup != 0) {
       Mp4AlternateGroupData alternateGroupEntry =
           new Mp4AlternateGroupData(tkhdData.alternateGroup);
       format =
-          stsdData
-              .format
+          format
               .buildUpon()
               .setMetadata(
-                  stsdData.format.metadata != null
-                      ? stsdData.format.metadata.copyWithAppendedEntries(alternateGroupEntry)
+                  format.metadata != null
+                      ? format.metadata.copyWithAppendedEntries(alternateGroupEntry)
                       : new Metadata(alternateGroupEntry))
               .build();
-    } else {
-      format = stsdData.format;
     }
     return new Track(
         tkhdData.id,
@@ -2188,15 +2193,21 @@ public final class BoxParser {
                   VorbisUtil.parseVorbisCsdFromEsdsInitializationData(initializationDataBytes);
             } else {
               if (MimeTypes.AUDIO_AAC.equals(mimeType)) {
-                // Update sampleRate and channelCount from the AudioSpecificConfig initialization
-                // data, which is more reliable. See [Internal: b/10903778].
-                AacUtil.Config aacConfig =
-                    AacUtil.parseAudioSpecificConfig(initializationDataBytes);
-                sampleRate = aacConfig.sampleRateHz;
-                channelCount = aacConfig.channelCount;
-                codecs = aacConfig.codecs;
+                try {
+                  // Update sampleRate and channelCount from the AudioSpecificConfig initialization
+                  // data, which is more reliable. See [Internal: b/10903778].
+                  AacUtil.Config aacConfig =
+                      AacUtil.parseAudioSpecificConfig(initializationDataBytes);
+                  sampleRate = aacConfig.sampleRateHz;
+                  channelCount = aacConfig.channelCount;
+                  codecs = aacConfig.codecs;
+                  initializationData = ImmutableList.of(initializationDataBytes);
+                } catch (ParserException e) {
+                  Log.w(TAG, "Ignoring malformed AAC AudioSpecificConfig in esds", e);
+                }
+              } else {
+                initializationData = ImmutableList.of(initializationDataBytes);
               }
-              initializationData = ImmutableList.of(initializationDataBytes);
             }
           }
         }
@@ -2354,10 +2365,13 @@ public final class BoxParser {
 
   /** Returns codec-specific initialization data contained in an esds box. */
   private static EsdsData parseEsdsFromParent(ParsableByteArray parent, int position) {
+    parent.setPosition(position);
+    long esdsEnd = Math.min(position + parent.readUnsignedInt(), parent.limit());
     parent.setPosition(position + Mp4Box.HEADER_SIZE + 4);
     // Start of the ES_Descriptor (defined in ISO/IEC 14496-1)
     parent.skipBytes(1); // ES_Descriptor tag
-    parseExpandableClassSize(parent);
+    int esDescriptorSize = parseExpandableClassSize(parent);
+    long esDescriptorEnd = Math.min(parent.getPosition() + (long) esDescriptorSize, esdsEnd);
     parent.skipBytes(2); // ES_ID
 
     int flags = parent.readUnsignedByte();
@@ -2373,7 +2387,9 @@ public final class BoxParser {
 
     // Start of the DecoderConfigDescriptor (defined in ISO/IEC 14496-1)
     parent.skipBytes(1); // DecoderConfigDescriptor tag
-    parseExpandableClassSize(parent);
+    int decoderConfigSize = parseExpandableClassSize(parent);
+    int decoderConfigEnd =
+        (int) Math.min(parent.getPosition() + (long) decoderConfigSize, esDescriptorEnd);
 
     // Set the MIME type based on the object type indication (ISO/IEC 14496-1 table 5).
     int objectTypeIndication = parent.readUnsignedByte();
@@ -2392,11 +2408,19 @@ public final class BoxParser {
     long peakBitrate = parent.readUnsignedInt();
     long bitrate = parent.readUnsignedInt();
 
-    // Start of the DecoderSpecificInfo.
-    parent.skipBytes(1); // DecoderSpecificInfo tag
-    int initializationDataSize = parseExpandableClassSize(parent);
-    byte[] initializationData = new byte[initializationDataSize];
-    parent.readBytes(initializationData, 0, initializationDataSize);
+    // Start of the optional DecoderSpecificInfo (tag 0x05 per ISO/IEC 14496-1).
+    @Nullable byte[] initializationData = null;
+    if (parent.getPosition() < decoderConfigEnd) {
+      int descriptorTag = parent.readUnsignedByte();
+      if (descriptorTag == 0x05 /* DecoderSpecificInfo tag */) {
+        int initializationDataSize = parseExpandableClassSize(parent, decoderConfigEnd);
+        if (initializationDataSize > 0
+            && initializationDataSize <= decoderConfigEnd - parent.getPosition()) {
+          initializationData = new byte[initializationDataSize];
+          parent.readBytes(initializationData, 0, initializationDataSize);
+        }
+      }
+    }
 
     // Skipping zero values as unknown.
     return new EsdsData(
@@ -2404,6 +2428,113 @@ public final class BoxParser {
         /* initializationData= */ initializationData,
         /* bitrate= */ bitrate > 0 ? bitrate : Format.NO_VALUE,
         /* peakBitrate= */ peakBitrate > 0 ? peakBitrate : Format.NO_VALUE);
+  }
+
+  private static final int[] AAC_STANDARD_SAMPLE_RATES =
+      new int[] {
+        96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350
+      };
+
+  @Nullable
+  private static Format synthesizeAacFormatIfPossible(
+      Format format, long timescale, Mp4Box.ContainerBox stbl) {
+    int channelCount = format.channelCount;
+    if (channelCount <= 0 || channelCount == 7 || channelCount > 8) {
+      Log.w(
+          TAG,
+          "Skipping AAC track without DecoderSpecificInfo (invalid channelCount="
+              + channelCount
+              + ")");
+      return null;
+    }
+
+    int sampleRate = findMatchingAacSampleRate(format.sampleRate);
+    if (sampleRate == C.INDEX_UNSET || sampleRate != format.sampleRate) {
+      sampleRate = findMatchingAacSampleRate(inferAacSampleRateFromStts(timescale, stbl));
+    }
+    if (sampleRate == C.INDEX_UNSET && format.sampleRate > 0) {
+      sampleRate = findMatchingAacSampleRate(format.sampleRate);
+    }
+    if (sampleRate == C.INDEX_UNSET && timescale > 0) {
+      sampleRate = findMatchingAacSampleRate(timescale);
+    }
+    if (sampleRate == C.INDEX_UNSET) {
+      Log.w(
+          TAG,
+          "Skipping AAC track without DecoderSpecificInfo (cannot infer sampleRate, timescale="
+              + timescale
+              + ")");
+      return null;
+    }
+
+    byte[] aacConfig = AacUtil.buildAacLcAudioSpecificConfig(sampleRate, channelCount);
+    Log.w(
+        TAG,
+        "Synthesizing AAC-LC AudioSpecificConfig for esds without DecoderSpecificInfo: sampleRate="
+            + sampleRate
+            + ", channelCount="
+            + channelCount);
+    return format
+        .buildUpon()
+        .setSampleRate(sampleRate)
+        .setChannelCount(channelCount)
+        .setCodecs("mp4a.40.2")
+        .setInitializationData(ImmutableList.of(aacConfig))
+        .build();
+  }
+
+  private static long inferAacSampleRateFromStts(long timescale, Mp4Box.ContainerBox stbl) {
+    if (timescale <= 0) {
+      return C.INDEX_UNSET;
+    }
+    @Nullable LeafBox sttsBox = stbl.getLeafBoxOfType(Mp4Box.TYPE_stts);
+    if (sttsBox == null) {
+      return C.INDEX_UNSET;
+    }
+    ParsableByteArray stts = sttsBox.data;
+    int savedPosition = stts.getPosition();
+    try {
+      stts.setPosition(Mp4Box.FULL_HEADER_SIZE);
+      if (stts.bytesLeft() < 12) {
+        return C.INDEX_UNSET;
+      }
+      int entryCount = stts.readUnsignedIntToInt();
+      if (entryCount <= 0) {
+        return C.INDEX_UNSET;
+      }
+      int entriesToScan = Math.min(entryCount, 10);
+      int bestSampleCount = -1;
+      int bestSampleDelta = 0;
+      for (int i = 0; i < entriesToScan && stts.bytesLeft() >= 8; i++) {
+        int sampleCount = stts.readUnsignedIntToInt();
+        int sampleDelta = stts.readUnsignedIntToInt();
+        if (sampleCount > bestSampleCount && sampleDelta > 0) {
+          bestSampleCount = sampleCount;
+          bestSampleDelta = sampleDelta;
+        }
+      }
+      if (bestSampleDelta <= 0) {
+        return C.INDEX_UNSET;
+      }
+      return Math.round((double) timescale * AacUtil.AAC_LC_AUDIO_SAMPLE_COUNT / bestSampleDelta);
+    } catch (RuntimeException e) {
+      return C.INDEX_UNSET;
+    } finally {
+      stts.setPosition(savedPosition);
+    }
+  }
+
+  private static int findMatchingAacSampleRate(long sampleRate) {
+    int bestRate = C.INDEX_UNSET;
+    long bestDiff = Long.MAX_VALUE;
+    for (int candidate : AAC_STANDARD_SAMPLE_RATES) {
+      long diff = Math.abs(candidate - sampleRate);
+      if (diff <= candidate / 20 && diff < bestDiff) {
+        bestDiff = diff;
+        bestRate = candidate;
+      }
+    }
+    return bestRate;
   }
 
   /**
@@ -2600,13 +2731,19 @@ public final class BoxParser {
 
   /** Parses the size of an expandable class, as specified by ISO/IEC 14496-1 subsection 8.3.3. */
   private static int parseExpandableClassSize(ParsableByteArray data) {
-    int currentByte = data.readUnsignedByte();
-    int size = currentByte & 0x7F;
-    while ((currentByte & 0x80) == 0x80) {
-      currentByte = data.readUnsignedByte();
-      size = (size << 7) | (currentByte & 0x7F);
+    return parseExpandableClassSize(data, data.limit());
+  }
+
+  private static int parseExpandableClassSize(ParsableByteArray data, int endPosition) {
+    int size = 0;
+    for (int i = 0; i < 4 && data.getPosition() < endPosition; i++) {
+      int value = data.readUnsignedByte();
+      size = (size << 7) | (value & 0x7F);
+      if ((value & 0x80) == 0) {
+        return size;
+      }
     }
-    return size;
+    return C.INDEX_UNSET;
   }
 
   /** Returns whether it's possible to apply the specified edit using gapless playback info. */

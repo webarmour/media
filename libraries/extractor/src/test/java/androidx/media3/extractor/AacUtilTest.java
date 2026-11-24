@@ -62,4 +62,11 @@ public final class AacUtilTest {
         ParserException.class,
         () -> AacUtil.parseAudioSpecificConfig(NOT_ENOUGH_ARBITRARY_SAMPLING_FREQ_BITS_HEADER));
   }
+
+  @Test
+  public void parseAudioSpecificConfig_truncatedOneByteHeader_throwsParserException() {
+    assertThrows(
+        ParserException.class,
+        () -> AacUtil.parseAudioSpecificConfig(new byte[] {0x02}));
+  }
 }
