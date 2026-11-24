@@ -193,7 +193,7 @@ public final class FfmpegAudioDecoder
     switch (mimeType) {
       case MimeTypes.AUDIO_AAC:
       case MimeTypes.AUDIO_OPUS:
-        return initializationData.get(0);
+        return initializationData.isEmpty() ? null : initializationData.get(0);
       case MimeTypes.AUDIO_ALAC:
         return getAlacExtraData(initializationData);
       case MimeTypes.AUDIO_VORBIS:

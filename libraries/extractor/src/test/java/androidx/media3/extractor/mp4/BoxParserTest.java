@@ -18,10 +18,12 @@ package androidx.media3.extractor.mp4;
 import static com.google.common.truth.Truth.assertThat;
 
 import androidx.media3.common.C;
+import androidx.media3.common.MimeTypes;
 import androidx.media3.common.ParserException;
 import androidx.media3.common.util.ParsableByteArray;
 import androidx.media3.common.util.Util;
 import androidx.media3.container.Mp4Box;
+import androidx.media3.extractor.AacUtil;
 import androidx.test.ext.junit.runners.AndroidJUnit4;
 import org.junit.Test;
 import org.junit.runner.RunWith;
@@ -286,6 +288,121 @@ public final class BoxParserTest {
         .isNotNull();
     assertThat(vexuData).isNotNull();
     assertThat(vexuData.hasBothEyeViews()).isTrue();
+  }
+
+  @Test
+  public void parseTrak_aacEsdsWithoutDecoderSpecificInfo_synthesizesValidAacConfig()
+      throws ParserException {
+    // 43 samples of delta 4096 at timescale 88200 imply a 22050 Hz AAC core.
+    // The decoder config has no tag 0x05. A separate SLConfigDescriptor follows it.
+    assertAacConfig(
+        /* sampleRateHex= */ "0000",
+        /* sampleDeltaHex= */ "00001000",
+        /* decoderConfigSizeHex= */ "0d",
+        /* trailingDescriptorsHex= */ "068080800102",
+        /* expectedSampleRate= */ 22050);
+  }
+
+  @Test
+  public void parseTrak_aacDecoderSpecificInfoCrossesDescriptorEnd_usesSampleEntryRate()
+      throws ParserException {
+    // At timescale 88200, delta 1920 represents 960 samples at 44100 Hz.
+    // The decoder config ends after the length byte. The following bytes look like 48000 Hz ASC.
+    assertAacConfig(
+        /* sampleRateHex= */ "ac44",
+        /* sampleDeltaHex= */ "00000780",
+        /* decoderConfigSizeHex= */ "0f",
+        /* trailingDescriptorsHex= */ "050211900102",
+        /* expectedSampleRate= */ 44100);
+  }
+
+  private static void assertAacConfig(
+      String sampleRateHex,
+      String sampleDeltaHex,
+      String decoderConfigSizeHex,
+      String trailingDescriptorsHex,
+      int expectedSampleRate)
+      throws ParserException {
+    Mp4Box.LeafBox mvhd =
+        new Mp4Box.LeafBox(
+            Mp4Box.TYPE_mvhd,
+            new ParsableByteArray(
+                Util.getBytesFromHexString(
+                    "0000006c6d766864000000000000000000000000000003e8000139050001000001000000000000"
+                        + "000000000000010000000000000000000000000000000100000000000000000000000000"
+                        + "004000000000000000000000000000000000000000000000000000000000000003")));
+    Mp4Box.LeafBox tkhd =
+        new Mp4Box.LeafBox(
+            Mp4Box.TYPE_tkhd,
+            new ParsableByteArray(
+                Util.getBytesFromHexString(
+                    "0000005c746b686400000003000000000000000000000002000000000001390500000000000000"
+                        + "000000000101000000000100000000000000000000000000000001000000000000000000"
+                        + "0000000000400000000000000000000000")));
+    Mp4Box.LeafBox mdhd =
+        new Mp4Box.LeafBox(
+            Mp4Box.TYPE_mdhd,
+            new ParsableByteArray(
+                Util.getBytesFromHexString(
+                    "000000206d64686400000000000000000000000000015888006bd80055c40000")));
+    Mp4Box.LeafBox hdlr =
+        new Mp4Box.LeafBox(
+            Mp4Box.TYPE_hdlr,
+            new ParsableByteArray(
+                Util.getBytesFromHexString(
+                    "0000002d68646c720000000000000000736f756e000000000000000000000000536f756e644861"
+                        + "6e646c657200")));
+    Mp4Box.LeafBox stsd =
+        new Mp4Box.LeafBox(
+            Mp4Box.TYPE_stsd,
+            new ParsableByteArray(
+                Util.getBytesFromHexString(
+                    "00000074737473640000000000000001000000646d703461000000000000000100000000000000"
+                        + "000002001000000000"
+                        + sampleRateHex
+                        + "00000000002c6573647300000000038080801b00020004808080"
+                        + decoderConfigSizeHex
+                        + "40150000000000bb940000bb94"
+                        + trailingDescriptorsHex
+                        + "0000001462747274000000000000bb940000bb94")));
+    Mp4Box.LeafBox stts =
+        new Mp4Box.LeafBox(
+            Mp4Box.TYPE_stts,
+            new ParsableByteArray(
+                Util.getBytesFromHexString(
+                    "000000187374747300000000000000010000002b" + sampleDeltaHex)));
+
+    Mp4Box.ContainerBox stbl = new Mp4Box.ContainerBox(Mp4Box.TYPE_stbl, /* endPosition= */ 0);
+    stbl.add(stsd);
+    stbl.add(stts);
+    Mp4Box.ContainerBox minf = new Mp4Box.ContainerBox(Mp4Box.TYPE_minf, /* endPosition= */ 0);
+    minf.add(stbl);
+    Mp4Box.ContainerBox mdia = new Mp4Box.ContainerBox(Mp4Box.TYPE_mdia, /* endPosition= */ 0);
+    mdia.add(mdhd);
+    mdia.add(hdlr);
+    mdia.add(minf);
+    Mp4Box.ContainerBox trak = new Mp4Box.ContainerBox(Mp4Box.TYPE_trak, /* endPosition= */ 0);
+    trak.add(tkhd);
+    trak.add(mdia);
+
+    Track track =
+        BoxParser.parseTrak(
+            trak,
+            mvhd,
+            /* duration= */ C.TIME_UNSET,
+            /* drmInitData= */ null,
+            /* ignoreEditLists= */ false,
+            /* isQuickTime= */ false);
+
+    assertThat(track).isNotNull();
+    assertThat(track.format.sampleMimeType).isEqualTo(MimeTypes.AUDIO_AAC);
+    assertThat(track.format.sampleRate).isEqualTo(expectedSampleRate);
+    assertThat(track.format.channelCount).isEqualTo(2);
+    assertThat(track.format.codecs).isEqualTo("mp4a.40.2");
+    assertThat(track.format.initializationData).hasSize(1);
+    AacUtil.Config parsed = AacUtil.parseAudioSpecificConfig(track.format.initializationData.get(0));
+    assertThat(parsed.sampleRateHz).isEqualTo(expectedSampleRate);
+    assertThat(parsed.channelCount).isEqualTo(2);
   }
 
   private static void verifyStz2Parsing(Mp4Box.LeafBox stz2Atom) {

@@ -211,6 +211,10 @@ public final class AacUtil {
       throws ParserException {
     int audioObjectType = getAudioObjectType(bitArray);
     int sampleRateHz = getSamplingFrequency(bitArray);
+    if (bitArray.bitsLeft() < 4) {
+      throw ParserException.createForMalformedContainer(
+          /* message= */ "AAC header insufficient data", /* cause= */ null);
+    }
     int channelConfiguration = bitArray.readBits(4);
     String codecs = CODECS_STRING_PREFIX + audioObjectType;
     if (audioObjectType == AUDIO_OBJECT_TYPE_AAC_SBR
@@ -224,6 +228,10 @@ public final class AacUtil {
       audioObjectType = getAudioObjectType(bitArray);
       if (audioObjectType == AUDIO_OBJECT_TYPE_AAC_ER_BSAC) {
         // Use the extensionChannelConfiguration.
+        if (bitArray.bitsLeft() < 4) {
+          throw ParserException.createForMalformedContainer(
+              /* message= */ "AAC header insufficient data", /* cause= */ null);
+        }
         channelConfiguration = bitArray.readBits(4);
       }
     }
@@ -293,7 +301,7 @@ public final class AacUtil {
         channelConfig = i;
       }
     }
-    if (sampleRate == C.INDEX_UNSET || channelConfig == C.INDEX_UNSET) {
+    if (sampleRateIndex == C.INDEX_UNSET || channelConfig == C.INDEX_UNSET) {
       throw new IllegalArgumentException(
           "Invalid sample rate or number of channels: " + sampleRate + ", " + channelCount);
     }
@@ -322,9 +330,17 @@ public final class AacUtil {
    * @param bitArray The bit array containing the audio specific configuration.
    * @return The audio object type.
    */
-  private static int getAudioObjectType(ParsableBitArray bitArray) {
+  private static int getAudioObjectType(ParsableBitArray bitArray) throws ParserException {
+    if (bitArray.bitsLeft() < 5) {
+      throw ParserException.createForMalformedContainer(
+          /* message= */ "AAC header insufficient data", /* cause= */ null);
+    }
     int audioObjectType = bitArray.readBits(5);
     if (audioObjectType == AUDIO_OBJECT_TYPE_ESCAPE) {
+      if (bitArray.bitsLeft() < 6) {
+        throw ParserException.createForMalformedContainer(
+            /* message= */ "AAC header insufficient data", /* cause= */ null);
+      }
       audioObjectType = 32 + bitArray.readBits(6);
     }
     return audioObjectType;
@@ -339,6 +355,10 @@ public final class AacUtil {
    * @throws ParserException If the audio specific configuration is invalid.
    */
   private static int getSamplingFrequency(ParsableBitArray bitArray) throws ParserException {
+    if (bitArray.bitsLeft() < 4) {
+      throw ParserException.createForMalformedContainer(
+          /* message= */ "AAC header insufficient data", /* cause= */ null);
+    }
     int samplingFrequency;
     int frequencyIndex = bitArray.readBits(4);
     if (frequencyIndex == AUDIO_SPECIFIC_CONFIG_FREQUENCY_INDEX_ARBITRARY) {
